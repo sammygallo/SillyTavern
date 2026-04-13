@@ -130,6 +130,28 @@ router.post('/revoke', requireMinRole(ROLES.ADMIN), async (request, response) =>
     }
 });
 
+// POST /api/invitations/delete — admin+
+router.post('/delete', requireMinRole(ROLES.ADMIN), async (request, response) => {
+    try {
+        const { id } = request.body;
+        if (!id) {
+            return response.status(400).json({ error: 'Missing id' });
+        }
+
+        /** @type {Invitation|undefined} */
+        const invite = await storage.getItem(inviteKey(id));
+        if (!invite) {
+            return response.status(404).json({ error: 'Invitation not found' });
+        }
+
+        await storage.removeItem(inviteKey(id));
+        return response.json({ id });
+    } catch (error) {
+        console.error('Delete invitation failed:', error);
+        return response.sendStatus(500);
+    }
+});
+
 // GET /api/invitations/validate/:token — public
 router.get('/validate/:token', async (request, response) => {
     try {

@@ -62,6 +62,7 @@ import { ensureThumbnailCache } from './endpoints/thumbnails.js';
 
 // Routers
 import { router as usersPublicRouter } from './endpoints/users-public.js';
+import { router as invitationsRouter } from './endpoints/invitations.js';
 import { init as statsInit, onExit as statsOnExit } from './endpoints/stats.js';
 import { checkForNewContent } from './endpoints/content-manager.js';
 import { init as settingsInit } from './endpoints/settings.js';
@@ -219,6 +220,7 @@ app.use(express.static(path.join(serverDirectory, 'public'), {}));
 
 // Public API
 app.use('/api/users', usersPublicRouter);
+app.use('/api/invitations', invitationsRouter);
 
 // Everything below this line requires authentication
 app.use(requireLoginMiddleware);
