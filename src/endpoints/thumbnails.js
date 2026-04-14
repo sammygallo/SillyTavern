@@ -9,6 +9,10 @@ import { Jimp, JimpMime } from '../jimp.js';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 
 import { getConfigValue, invalidateFirefoxCache } from '../util.js';
+import {
+    isGlobal as isGlobalCharacter,
+    makeGlobalScopedDirectories,
+} from '../character-globals.js';
 
 const thumbnailsEnabled = !!getConfigValue('thumbnails.enabled', true, 'boolean');
 const quality = Math.min(100, Math.max(1, parseInt(getConfigValue('thumbnails.quality', 95, 'number'))));
@@ -208,8 +212,15 @@ router.get('/', async function (request, response) {
             return response.sendStatus(403);
         }
 
+        // For avatars, resolve global characters against _global/characters/
+        // so users who don't have the character in their personal dir can
+        // still see its thumbnail. Globals cache under _global/thumbnails/avatar/.
+        const directoriesForType = (type === 'avatar' && isGlobalCharacter(file))
+            ? makeGlobalScopedDirectories(request.user.directories)
+            : request.user.directories;
+
         if (!thumbnailsEnabled) {
-            const folder = getOriginalFolder(request.user.directories, type);
+            const folder = getOriginalFolder(directoriesForType, type);
 
             if (folder === undefined) {
                 return response.sendStatus(400);
@@ -228,7 +239,7 @@ router.get('/', async function (request, response) {
             return response.send(originalFile);
         }
 
-        const pathToCachedFile = await generateThumbnail(request.user.directories, type, file);
+        const pathToCachedFile = await generateThumbnail(directoriesForType, type, file);
 
         if (!pathToCachedFile) {
             return response.sendStatus(404);
