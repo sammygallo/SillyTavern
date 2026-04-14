@@ -47,7 +47,6 @@ import { router as speechRouter } from './endpoints/speech.js';
 import { router as azureRouter } from './endpoints/azure.js';
 import { router as minimaxRouter } from './endpoints/minimax.js';
 import { router as dataMaidRouter } from './endpoints/data-maid.js';
-import { router as invitationsRouter } from './endpoints/invitations.js';
 
 /**
  * @typedef {object} ServerStartupResult
@@ -136,7 +135,6 @@ export function setupPrivateEndpoints(app) {
     app.use('/', userDataRouter);
     app.use('/api/users', usersPrivateRouter);
     app.use('/api/users', usersAdminRouter);
-    app.use('/api/invitations', invitationsRouter);
     app.use('/api/moving-ui', movingUIRouter);
     app.use('/api/images', imagesRouter);
     app.use('/api/quick-replies', quickRepliesRouter);
