@@ -12,7 +12,7 @@ import mime from 'mime-types';
 import { Jimp, JimpMime } from '../jimp.js';
 import storage from 'node-persist';
 
-import { AVATAR_WIDTH, AVATAR_HEIGHT, DEFAULT_AVATAR_PATH } from '../constants.js';
+import { AVATAR_WIDTH, AVATAR_HEIGHT, DEFAULT_AVATAR_PATH, ROLES } from '../constants.js';
 import { default as validateAvatarUrlMiddleware, getFileNameValidationFunction } from '../middleware/validateFileName.js';
 import { deepMerge, humanizedISO8601DateTime, tryParse, extractFileFromZipBuffer, MemoryLimitedMap, getConfigValue, mutateJsonString, clientRelativePath, getUniqueName, sanitizeSafeCharacterReplacements } from '../util.js';
 import { TavernCardValidator } from '../validator/TavernCardValidator.js';
@@ -20,10 +20,23 @@ import { parse, read, write } from '../character-card-parser.js';
 import { readWorldInfoFile } from './worldinfo.js';
 import { invalidateThumbnail } from './thumbnails.js';
 import { importRisuSprites } from './sprites.js';
-import { getUserDirectories } from '../users.js';
+import { getUserDirectories, requireMinRole, getEffectiveRole } from '../users.js';
 import { getChatInfo } from './chats.js';
 import { ByafParser } from '../byaf.js';
 import cacheBuster from '../middleware/cacheBuster.js';
+import {
+    readMetadata as readCharacterMetadata,
+    getEntry as getCharacterMetadataEntry,
+    isGlobal as isGlobalCharacter,
+    resolveCharacterPath,
+    listGlobalCharacterFiles,
+    makeGlobalScopedDirectories,
+    setVisibility as setCharacterVisibility,
+    removeMetadataEntry as removeCharacterMetadataEntry,
+    renameMetadataEntry as renameCharacterMetadataEntry,
+    getGlobalCharactersDir,
+    getGlobalThumbnailsDir,
+} from '../character-globals.js';
 
 // With 100 MB limit it would take roughly 3000 characters to reach this limit
 const memoryCacheCapacity = getConfigValue('performance.memoryCacheCapacity', '100mb');
@@ -253,7 +266,12 @@ async function writeCharacterData(inputFile, data, outputFile, request, crop = u
 
         // Get the chunks
         const outputImage = write(inputImage, data);
-        const outputImagePath = path.join(request.user.directories.characters, `${outputFile}.png`);
+        // Route the write to the global dir if the character is currently global;
+        // otherwise to the caller's personal directory.
+        const outputDir = isGlobalCharacter(`${outputFile}.png`)
+            ? getGlobalCharactersDir()
+            : request.user.directories.characters;
+        const outputImagePath = path.join(outputDir, `${outputFile}.png`);
 
         writeFileAtomicSync(outputImagePath, outputImage);
         return true;
@@ -380,6 +398,8 @@ const toShallow = (character) => {
         chat_size: character.chat_size,
         data_size: character.data_size,
         tags: character.tags,
+        visibility: character.visibility,
+        owner_handle: character.owner_handle,
         data: {
             name: _.get(character, 'data.name', ''),
             character_version: _.get(character, 'data.character_version', ''),
@@ -402,9 +422,14 @@ const toShallow = (character) => {
  * @param  {boolean} options.shallow If true, only return the core character's metadata
  * @return {Promise<object>}     A Promise that resolves when the character processing is done.
  */
-const processCharacter = async (item, directories, { shallow }) => {
+const processCharacter = async (item, directories, { shallow, scope = 'personal' }) => {
     try {
-        const imgFile = path.join(directories.characters, item);
+        // Global characters live in _global/characters/ but their per-user chat
+        // histories still live in the caller's personal chats directory.
+        const charactersDir = scope === 'global'
+            ? getGlobalCharactersDir()
+            : directories.characters;
+        const imgFile = path.join(charactersDir, item);
         const imgData = await readCharacterData(imgFile);
         if (imgData === undefined) throw new Error('Failed to read character file');
 
@@ -412,7 +437,7 @@ const processCharacter = async (item, directories, { shallow }) => {
         jsonObject.avatar = item;
         const character = jsonObject;
         character['json_data'] = imgData;
-        const charStat = fs.statSync(path.join(directories.characters, item));
+        const charStat = fs.statSync(imgFile);
         character['date_added'] = charStat.ctimeMs;
         character['create_date'] = jsonObject['create_date'] || humanizedISO8601DateTime(charStat.ctimeMs);
         const chatsDirectory = path.join(directories.chats, item.replace('.png', ''));
@@ -421,6 +446,12 @@ const processCharacter = async (item, directories, { shallow }) => {
         character['chat_size'] = chatSize;
         character['date_last_chat'] = dateLastChat;
         character['data_size'] = calculateDataSize(jsonObject?.data);
+
+        // Attach global-visibility metadata so the frontend can render
+        // ownership badges and permission-gate UI without extra round trips.
+        const metadataEntry = getCharacterMetadataEntry(item);
+        character['visibility'] = scope === 'global' ? 'global' : (metadataEntry?.visibility ?? 'personal');
+        character['owner_handle'] = metadataEntry?.ownerHandle ?? null;
         return shallow ? toShallow(character) : character;
     }
     catch (err) {
@@ -1057,13 +1088,42 @@ router.post('/rename', validateAvatarUrlMiddleware, async function (request, res
     const oldAvatarName = request.body.avatar_url;
     const newName = sanitize(request.body.new_name);
     const oldInternalName = path.parse(request.body.avatar_url).name;
-    const newInternalName = getPngName(newName, request.user.directories);
+
+    // Resolve the old location (personal vs global) — renames stay in the
+    // same scope: a global character's rename updates _global/characters/,
+    // a personal rename stays in the caller's dir.
+    const resolvedOld = resolveCharacterPath(request.user.directories, oldAvatarName);
+    if (!resolvedOld.exists) {
+        return response.sendStatus(404);
+    }
+
+    // Enforce owner-only renames on globals.
+    if (resolvedOld.scope === 'global') {
+        const entry = getCharacterMetadataEntry(oldAvatarName);
+        const callerHandle = request.user.profile?.handle;
+        const callerRole = getEffectiveRole(request.user.profile);
+        if (callerRole !== ROLES.OWNER && entry?.ownerHandle !== callerHandle) {
+            return response.sendStatus(403);
+        }
+    }
+
+    // Derive a fresh PNG name that doesn't collide in the target directory.
+    const targetDir = resolvedOld.scope === 'global'
+        ? getGlobalCharactersDir()
+        : request.user.directories.characters;
+    let newInternalName = newName;
+    let collisionSuffix = 1;
+    while (fs.existsSync(path.join(targetDir, `${newInternalName}.png`))) {
+        newInternalName = newName + collisionSuffix;
+        collisionSuffix++;
+    }
     const newAvatarName = `${newInternalName}.png`;
 
-    const oldAvatarPath = path.join(request.user.directories.characters, oldAvatarName);
-
+    // Chats still live per-user regardless of scope, so the old/new chat
+    // folders are always resolved against the caller's own chats dir.
     const oldChatsPath = path.join(request.user.directories.chats, oldInternalName);
     const newChatsPath = path.join(request.user.directories.chats, newInternalName);
+    const oldAvatarPath = resolvedOld.path;
 
     try {
         // Read old file, replace name int it
@@ -1075,7 +1135,13 @@ router.post('/rename', validateAvatarUrlMiddleware, async function (request, res
         _.set(oldData, 'name', newName);
         const newData = JSON.stringify(oldData);
 
-        // Write data to new location
+        // Write data to new location. writeCharacterData routes to the
+        // global dir if the *new* name is marked global in metadata, which
+        // won't be the case until we update metadata below — so for globals
+        // we pre-register the new name first.
+        if (resolvedOld.scope === 'global') {
+            renameCharacterMetadataEntry(oldAvatarName, newAvatarName);
+        }
         await writeCharacterData(oldAvatarPath, newData, newInternalName, request);
 
         // Rename chats folder
@@ -1115,14 +1181,34 @@ router.post('/edit', validateAvatarUrlMiddleware, async function (request, respo
     char = JSON.stringify(char);
     let targetFile = (request.body.avatar_url).replace('.png', '');
 
+    // Gate edits to global characters: only the owner user AND only the
+    // app-level OWNER role may edit a global character.
+    const resolved = resolveCharacterPath(request.user.directories, request.body.avatar_url);
+    if (resolved.scope === 'global') {
+        const entry = getCharacterMetadataEntry(request.body.avatar_url);
+        const callerHandle = request.user.profile?.handle;
+        const callerRole = getEffectiveRole(request.user.profile);
+        if (callerRole !== ROLES.OWNER && entry?.ownerHandle !== callerHandle) {
+            console.warn(`Refusing to edit global character ${request.body.avatar_url} — caller ${callerHandle} is not owner.`);
+            return response.sendStatus(403);
+        }
+    }
+
     try {
         if (!request.file) {
-            const avatarPath = path.join(request.user.directories.characters, request.body.avatar_url);
+            // Source buffer to read from — resolved to global dir if global,
+            // otherwise personal dir. writeCharacterData then routes the
+            // destination the same way via isGlobalCharacter().
+            const avatarPath = resolved.path;
             await writeCharacterData(avatarPath, char, targetFile, request);
         } else {
             const crop = tryParse(request.query.crop);
             const newAvatarPath = path.join(request.file.destination, request.file.filename);
-            invalidateThumbnail(request.user.directories, 'avatar', request.body.avatar_url);
+            // Invalidate whichever thumbnail scope the character lives in.
+            const thumbDirs = resolved.scope === 'global'
+                ? makeGlobalScopedDirectories(request.user.directories)
+                : request.user.directories;
+            invalidateThumbnail(thumbDirs, 'avatar', request.body.avatar_url);
             await writeCharacterData(newAvatarPath, char, targetFile, request, crop);
             fs.unlinkSync(newAvatarPath);
 
@@ -1151,11 +1237,22 @@ router.post('/edit-avatar', validateAvatarUrlMiddleware, async function (request
         if (!fs.existsSync(uploadPath)) {
             return response.status(400).send('Error: uploaded file does not exist');
         }
-        const characterPath = path.join(request.user.directories.characters, request.body.avatar_url);
-        if (!fs.existsSync(characterPath)) {
+        const resolved = resolveCharacterPath(request.user.directories, request.body.avatar_url);
+        if (!resolved.exists) {
             return response.status(400).send('Error: character file does not exist');
         }
-        const data = await readCharacterData(characterPath);
+
+        // Enforce owner-only edits on global characters.
+        if (resolved.scope === 'global') {
+            const entry = getCharacterMetadataEntry(request.body.avatar_url);
+            const callerHandle = request.user.profile?.handle;
+            const callerRole = getEffectiveRole(request.user.profile);
+            if (callerRole !== ROLES.OWNER && entry?.ownerHandle !== callerHandle) {
+                return response.sendStatus(403);
+            }
+        }
+
+        const data = await readCharacterData(resolved.path);
         if (!data) {
             return response.status(400).send('Error: failed to read character data');
         }
@@ -1169,7 +1266,10 @@ router.post('/edit-avatar', validateAvatarUrlMiddleware, async function (request
 
         // Reset images caches
         cacheBuster.bust(request, response);
-        invalidateThumbnail(request.user.directories, 'avatar', request.body.avatar_url);
+        const thumbDirs = resolved.scope === 'global'
+            ? makeGlobalScopedDirectories(request.user.directories)
+            : request.user.directories;
+        invalidateThumbnail(thumbDirs, 'avatar', request.body.avatar_url);
 
         return response.sendStatus(200);
     } catch (err) {
@@ -1206,8 +1306,19 @@ router.post('/edit-attribute', validateAvatarUrlMiddleware, async function (requ
     }
 
     try {
-        const avatarPath = path.join(request.user.directories.characters, request.body.avatar_url);
-        const charJSON = await readCharacterData(avatarPath);
+        const resolved = resolveCharacterPath(request.user.directories, request.body.avatar_url);
+        if (!resolved.exists) {
+            return response.status(400).send('Error: character not found');
+        }
+        if (resolved.scope === 'global') {
+            const entry = getCharacterMetadataEntry(request.body.avatar_url);
+            const callerHandle = request.user.profile?.handle;
+            const callerRole = getEffectiveRole(request.user.profile);
+            if (callerRole !== ROLES.OWNER && entry?.ownerHandle !== callerHandle) {
+                return response.sendStatus(403);
+            }
+        }
+        const charJSON = await readCharacterData(resolved.path);
         if (typeof charJSON !== 'string') throw new Error('Failed to read character file');
 
         const char = JSON.parse(charJSON);
@@ -1221,7 +1332,7 @@ router.post('/edit-attribute', validateAvatarUrlMiddleware, async function (requ
         char.data[request.body.field] = request.body.value;
         let newCharJSON = JSON.stringify(char);
         const targetFile = (request.body.avatar_url).replace('.png', '');
-        await writeCharacterData(avatarPath, newCharJSON, targetFile, request);
+        await writeCharacterData(resolved.path, newCharJSON, targetFile, request);
         return response.sendStatus(200);
     } catch (err) {
         console.error('An error occurred, character edit invalidated.', err);
@@ -1243,7 +1354,20 @@ router.post('/edit-attribute', validateAvatarUrlMiddleware, async function (requ
 router.post('/merge-attributes', getFileNameValidationFunction('avatar'), async function (request, response) {
     try {
         const update = request.body;
-        const avatarPath = path.join(request.user.directories.characters, update.avatar);
+        const resolved = resolveCharacterPath(request.user.directories, update.avatar);
+        if (!resolved.exists) {
+            console.error('Error: character not found for merge.');
+            return response.status(400).send('Error: character not found.');
+        }
+        if (resolved.scope === 'global') {
+            const entry = getCharacterMetadataEntry(update.avatar);
+            const callerHandle = request.user.profile?.handle;
+            const callerRole = getEffectiveRole(request.user.profile);
+            if (callerRole !== ROLES.OWNER && entry?.ownerHandle !== callerHandle) {
+                return response.sendStatus(403);
+            }
+        }
+        const avatarPath = resolved.path;
 
         const pngStringData = await readCharacterData(avatarPath);
 
@@ -1285,13 +1409,29 @@ router.post('/delete', validateAvatarUrlMiddleware, async function (request, res
         return response.sendStatus(403);
     }
 
-    const avatarPath = path.join(request.user.directories.characters, request.body.avatar_url);
-    if (!fs.existsSync(avatarPath)) {
+    const resolved = resolveCharacterPath(request.user.directories, request.body.avatar_url);
+    if (!resolved.exists) {
         return response.sendStatus(400);
     }
 
-    fs.unlinkSync(avatarPath);
-    invalidateThumbnail(request.user.directories, 'avatar', request.body.avatar_url);
+    // Deleting a global character is owner-only and also clears metadata.
+    if (resolved.scope === 'global') {
+        const entry = getCharacterMetadataEntry(request.body.avatar_url);
+        const callerHandle = request.user.profile?.handle;
+        const callerRole = getEffectiveRole(request.user.profile);
+        if (callerRole !== ROLES.OWNER && entry?.ownerHandle !== callerHandle) {
+            return response.sendStatus(403);
+        }
+    }
+
+    fs.unlinkSync(resolved.path);
+    const thumbDirs = resolved.scope === 'global'
+        ? makeGlobalScopedDirectories(request.user.directories)
+        : request.user.directories;
+    invalidateThumbnail(thumbDirs, 'avatar', request.body.avatar_url);
+    if (resolved.scope === 'global') {
+        removeCharacterMetadataEntry(request.body.avatar_url);
+    }
     let dir_name = (request.body.avatar_url.replace('.png', ''));
 
     if (!dir_name.length) {
@@ -1327,9 +1467,21 @@ router.post('/delete', validateAvatarUrlMiddleware, async function (request, res
  */
 router.post('/all', async function (request, response) {
     try {
-        const files = fs.readdirSync(request.user.directories.characters);
-        const pngFiles = files.filter(file => file.endsWith('.png'));
-        const processingPromises = pngFiles.map(file => processCharacter(file, request.user.directories, { shallow: useShallowCharacters }));
+        // Personal characters from the caller's own directory.
+        const personalFiles = fs.readdirSync(request.user.directories.characters)
+            .filter(file => file.endsWith('.png'));
+
+        // Global characters from _global/characters/, minus any that collide
+        // with a personal filename (personal takes precedence — users should
+        // never lose access to their own files if a global happens to match).
+        const personalSet = new Set(personalFiles);
+        const globalFiles = listGlobalCharacterFiles()
+            .filter(file => !personalSet.has(file));
+
+        const processingPromises = [
+            ...personalFiles.map(file => processCharacter(file, request.user.directories, { shallow: useShallowCharacters, scope: 'personal' })),
+            ...globalFiles.map(file => processCharacter(file, request.user.directories, { shallow: useShallowCharacters, scope: 'global' })),
+        ];
         const data = (await Promise.all(processingPromises)).filter(c => c.name);
         return response.send(data);
     } catch (err) {
@@ -1343,13 +1495,13 @@ router.post('/get', validateAvatarUrlMiddleware, async function (request, respon
     try {
         if (!request.body) return response.sendStatus(400);
         const item = request.body.avatar_url;
-        const filePath = path.join(request.user.directories.characters, item);
+        const resolved = resolveCharacterPath(request.user.directories, item);
 
-        if (!fs.existsSync(filePath)) {
+        if (!resolved.exists) {
             return response.sendStatus(404);
         }
 
-        const data = await processCharacter(item, request.user.directories, { shallow: false });
+        const data = await processCharacter(item, request.user.directories, { shallow: false, scope: resolved.scope });
 
         return response.send(data);
     } catch (err) {
@@ -1471,11 +1623,14 @@ router.post('/duplicate', validateAvatarUrlMiddleware, async function (request, 
             console.debug(request.body);
             return response.sendStatus(400);
         }
-        let filename = path.join(request.user.directories.characters, sanitize(request.body.avatar_url));
-        if (!fs.existsSync(filename)) {
-            console.error('file for dupe not found', filename);
+        // Duplicating a global character creates a NEW personal copy in the
+        // caller's directory. Duplicating a personal character stays personal.
+        const resolvedSource = resolveCharacterPath(request.user.directories, request.body.avatar_url);
+        if (!resolvedSource.exists) {
+            console.error('file for dupe not found', resolvedSource.path);
             return response.sendStatus(404);
         }
+        let filename = resolvedSource.path;
         let suffix = 1;
         let newFilename = filename;
 
@@ -1516,11 +1671,11 @@ router.post('/export', validateAvatarUrlMiddleware, async function (request, res
             return response.sendStatus(400);
         }
 
-        let filename = path.join(request.user.directories.characters, sanitize(request.body.avatar_url));
-
-        if (!fs.existsSync(filename)) {
+        const resolvedExport = resolveCharacterPath(request.user.directories, request.body.avatar_url);
+        if (!resolvedExport.exists) {
             return response.sendStatus(404);
         }
+        const filename = resolvedExport.path;
 
         switch (request.body.format) {
             case 'png': {
@@ -1551,5 +1706,85 @@ router.post('/export', validateAvatarUrlMiddleware, async function (request, res
     } catch (err) {
         console.error('Character export failed', err);
         response.sendStatus(500);
+    }
+});
+
+// -----------------------------------------------------------------------------
+// Global character visibility endpoints
+// -----------------------------------------------------------------------------
+
+/**
+ * POST /api/characters/metadata
+ *
+ * Returns the character ownership/visibility map. Public read — any logged-in
+ * user can see which characters are global and who owns them so the client
+ * can render badges and gate UI actions.
+ */
+router.post('/metadata', async function (request, response) {
+    try {
+        const metadata = readCharacterMetadata();
+        return response.send(metadata);
+    } catch (err) {
+        console.error('Failed to read character metadata', err);
+        return response.status(500).send({ error: true });
+    }
+});
+
+/**
+ * POST /api/characters/set-visibility
+ *
+ * Body: { avatar_url: string, visibility: 'global' | 'personal' }
+ *
+ * OWNER-only. Physically moves the character file between the caller's
+ * personal directory and _global/characters/ and updates
+ * _global/character-metadata.json.
+ *
+ * Setting `global` on a character that's currently in the caller's personal
+ * dir moves it into the global dir and records the caller as its owner.
+ * Setting `personal` on a global character moves it into the caller's own
+ * personal dir (not the original owner's).
+ */
+router.post('/set-visibility', requireMinRole(ROLES.OWNER), validateAvatarUrlMiddleware, async function (request, response) {
+    try {
+        if (!request.body?.avatar_url || !request.body?.visibility) {
+            return response.sendStatus(400);
+        }
+        const visibility = request.body.visibility;
+        if (visibility !== 'global' && visibility !== 'personal') {
+            return response.status(400).send({ error: 'invalid_visibility' });
+        }
+
+        const callerHandle = request.user.profile?.handle;
+        if (!callerHandle) {
+            return response.sendStatus(401);
+        }
+
+        // Invalidate thumbnails on both sides so stale cached files don't
+        // serve from the wrong scope after the move.
+        const avatar = request.body.avatar_url;
+        invalidateThumbnail(request.user.directories, 'avatar', avatar);
+        invalidateThumbnail(makeGlobalScopedDirectories(request.user.directories), 'avatar', avatar);
+
+        const result = setCharacterVisibility({
+            avatar,
+            visibility,
+            ownerHandle: callerHandle,
+            ownerDirectories: request.user.directories,
+        });
+
+        if (result.reason === 'source_missing') {
+            return response.status(404).send({ error: 'source_missing' });
+        }
+        if (result.reason === 'destination_exists') {
+            return response.status(409).send({ error: 'destination_exists' });
+        }
+        if (result.reason && result.reason !== undefined) {
+            return response.status(500).send({ error: result.reason });
+        }
+
+        return response.send({ ok: true, moved: result.moved, visibility });
+    } catch (err) {
+        console.error('Failed to set character visibility', err);
+        return response.sendStatus(500);
     }
 });
