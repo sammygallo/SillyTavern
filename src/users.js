@@ -18,6 +18,7 @@ import sanitize from 'sanitize-filename';
 import { USER_DIRECTORY_TEMPLATE, DEFAULT_USER, PUBLIC_DIRECTORIES, SETTINGS_FILE, UPLOADS_DIRECTORY, ROLES, ROLE_HIERARCHY } from './constants.js';
 import { getConfigValue, color, delay, generateTimestamp, invalidateFirefoxCache } from './util.js';
 import { readSecret, writeSecret } from './endpoints/secrets.js';
+import { getGlobalCharactersDir } from './character-globals.js';
 import { getContentOfType } from './endpoints/content-manager.js';
 import { serverDirectory } from './server-directory.js';
 
@@ -1188,7 +1189,24 @@ export async function getAllEnabledUsers() {
  */
 export const router = express.Router();
 router.use('/backgrounds/*', createRouteHandler(req => req.user.directories.backgrounds));
-router.use('/characters/*', createRouteHandler(req => req.user.directories.characters));
+router.use('/characters/*', async (req, res) => {
+    try {
+        const filePath = decodeURIComponent(req.params[0]);
+        const personalDir = req.user.directories.characters;
+        if (fs.existsSync(path.join(personalDir, filePath))) {
+            invalidateFirefoxCache(filePath, req, res);
+            return res.sendFile(filePath, { root: personalDir });
+        }
+        const globalDir = getGlobalCharactersDir();
+        if (fs.existsSync(path.join(globalDir, filePath))) {
+            invalidateFirefoxCache(filePath, req, res);
+            return res.sendFile(filePath, { root: globalDir });
+        }
+        return res.sendStatus(404);
+    } catch (error) {
+        return res.sendStatus(500);
+    }
+});
 router.use('/User%20Avatars/*', createRouteHandler(req => req.user.directories.avatars));
 router.use('/assets/*', createRouteHandler(req => req.user.directories.assets));
 router.use('/user/images/*', createRouteHandler(req => req.user.directories.userImages));
