@@ -5,8 +5,8 @@ import express from 'express';
 import sanitize from 'sanitize-filename';
 import { CheckRepoActions, default as simpleGit } from 'simple-git';
 
-import { PUBLIC_DIRECTORIES, ROLES } from '../constants.js';
-import { getEffectiveRole, hasRole } from '../users.js';
+import { PUBLIC_DIRECTORIES } from '../constants.js';
+import { hasPermission } from '../permissions.js';
 
 /**
  * @type {Partial<import('simple-git').SimpleGitOptions>}
@@ -91,7 +91,7 @@ router.post('/install', async (request, response) => {
 
         const { url, global, branch } = request.body;
 
-        if (global && !hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
+        if (global && !(await hasPermission(request.user.profile, 'extension:manage_global'))) {
             console.error(`User ${request.user.profile.handle} does not have permission to install global extensions.`);
             return response.status(403).send('Forbidden: No permission to install global extensions.');
         }
@@ -138,7 +138,7 @@ router.post('/update', async (request, response) => {
     try {
         const { extensionName, global } = request.body;
 
-        if (global && !hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
+        if (global && !(await hasPermission(request.user.profile, 'extension:manage_global'))) {
             console.error(`User ${request.user.profile.handle} does not have permission to update global extensions.`);
             return response.status(403).send('Forbidden: No permission to update global extensions.');
         }
@@ -182,7 +182,7 @@ router.post('/branches', async (request, response) => {
             return response.status(400).send('Bad Request: extensionName is required in the request body.');
         }
 
-        if (global && !hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
+        if (global && !(await hasPermission(request.user.profile, 'extension:manage_global'))) {
             console.error(`User ${request.user.profile.handle} does not have permission to list branches of global extensions.`);
             return response.status(403).send('Forbidden: No permission to list branches of global extensions.');
         }
@@ -227,7 +227,7 @@ router.post('/switch', async (request, response) => {
             return response.status(400).send('Bad Request: extensionName and branch are required in the request body.');
         }
 
-        if (global && !hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
+        if (global && !(await hasPermission(request.user.profile, 'extension:manage_global'))) {
             console.error(`User ${request.user.profile.handle} does not have permission to switch branches of global extensions.`);
             return response.status(403).send('Forbidden: No permission to switch branches of global extensions.');
         }
@@ -286,8 +286,11 @@ router.post('/move', async (request, response) => {
             return response.status(400).send('Bad Request. Not all required parameters are provided.');
         }
 
-        if (!hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
-            console.error(`User ${request.user.profile.handle} does not have permission to move extensions.`);
+        // Move requires permission to manage both source and destination scopes.
+        const movingToGlobal = destination === 'global';
+        const movingFromGlobal = source === 'global';
+        if ((movingToGlobal || movingFromGlobal) && !(await hasPermission(request.user.profile, 'extension:manage_global'))) {
+            console.error(`User ${request.user.profile.handle} does not have permission to move extensions in/out of global scope.`);
             return response.status(403).send('Forbidden: No permission to move extensions.');
         }
 
@@ -391,7 +394,7 @@ router.post('/delete', async (request, response) => {
     try {
         const { extensionName, global } = request.body;
 
-        if (global && !hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
+        if (global && !(await hasPermission(request.user.profile, 'extension:manage_global'))) {
             console.error(`User ${request.user.profile.handle} does not have permission to delete global extensions.`);
             return response.status(403).send('Forbidden: No permission to delete global extensions.');
         }

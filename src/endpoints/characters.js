@@ -20,7 +20,8 @@ import { parse, read, write } from '../character-card-parser.js';
 import { readWorldInfoFile } from './worldinfo.js';
 import { invalidateThumbnail } from './thumbnails.js';
 import { importRisuSprites } from './sprites.js';
-import { getUserDirectories, requireMinRole, getEffectiveRole } from '../users.js';
+import { getUserDirectories, getEffectiveRole } from '../users.js';
+import { requirePermission } from '../permissions.js';
 import { getChatInfo } from './chats.js';
 import { ByafParser } from '../byaf.js';
 import cacheBuster from '../middleware/cacheBuster.js';
@@ -1744,7 +1745,7 @@ router.post('/metadata', async function (request, response) {
  * Setting `personal` on a global character moves it into the caller's own
  * personal dir (not the original owner's).
  */
-router.post('/set-visibility', requireMinRole(ROLES.OWNER), validateAvatarUrlMiddleware, async function (request, response) {
+router.post('/set-visibility', requirePermission('character:set_global'), validateAvatarUrlMiddleware, async function (request, response) {
     try {
         if (!request.body?.avatar_url || !request.body?.visibility) {
             return response.sendStatus(400);
