@@ -7,16 +7,20 @@ import lodash from 'lodash';
 import { checkForNewContent, CONTENT_TYPES } from './content-manager.js';
 import {
     toKey,
-    requireMinRole,
-    getEffectiveRole,
-    hasRole,
     getAllUserHandles,
     getPasswordSalt,
     getPasswordHash,
     getUserDirectories,
     ensurePublicDirectoriesExist,
 } from '../users.js';
-import { ROLES, ROLE_HIERARCHY } from '../constants.js';
+import {
+    requirePermission,
+    getPermissionGroupById,
+    canAssignGroup,
+    deriveLegacyShims,
+    legacyRoleToGroupId,
+    END_USER_GROUP_ID,
+} from '../permissions.js';
 
 export const router = express.Router();
 
@@ -26,7 +30,8 @@ const INVITE_PREFIX = 'invite:';
  * @typedef {object} Invitation
  * @property {string} id
  * @property {string} token
- * @property {string} role
+ * @property {string} groupId  - Permission group id to assign on accept.
+ * @property {string} [role]   - @deprecated Shim for pre-groups invitations.
  * @property {string} label
  * @property {string} createdBy
  * @property {number} createdAt
@@ -48,32 +53,64 @@ function inviteKey(id) {
  * @returns {Promise<Invitation[]>}
  */
 async function getAllInvitations() {
-    return storage.values(x => x.key.startsWith(INVITE_PREFIX));
+    /** @type {Invitation[]} */
+    const raw = await storage.values(x => x.key.startsWith(INVITE_PREFIX));
+    // In-flight migration: if a stored invitation only has `role`, synthesize
+    // a `groupId` at read time so the rest of the code can assume groupId is
+    // always present.
+    return raw.map(inv => {
+        if (!inv.groupId && inv.role) {
+            return { ...inv, groupId: legacyRoleToGroupId(inv.role, undefined) };
+        }
+        return inv;
+    });
 }
 
-// POST /api/invitations/create — admin+
-router.post('/create', requireMinRole(ROLES.ADMIN), async (request, response) => {
+// POST /api/invitations/create — requires admin:invitations:manage
+router.post('/create', requirePermission('admin:invitations:manage'), async (request, response) => {
     try {
-        const actorRole = getEffectiveRole(request.user.profile);
-
-        let role = request.body.role || ROLES.END_USER;
-        if (!ROLE_HIERARCHY.includes(role)) {
-            role = ROLES.END_USER;
+        // Determine target groupId: prefer explicit `groupId`, fall back to
+        // legacy `role` shape. Default to end-user-default.
+        let targetGroupId = '';
+        if (typeof request.body.groupId === 'string' && request.body.groupId) {
+            targetGroupId = request.body.groupId;
+        } else if (request.body.role) {
+            console.warn(
+                `[Permissions] Deprecated: /invitations/create called with { role: '${request.body.role}' } — `
+                + 'update caller to send { groupId } instead.',
+            );
+            targetGroupId = legacyRoleToGroupId(request.body.role, undefined);
+        } else {
+            targetGroupId = END_USER_GROUP_ID;
         }
-        // Non-owners cannot create invites for admin/owner roles
-        if (actorRole !== ROLES.OWNER && hasRole(role, ROLES.ADMIN)) {
-            role = ROLES.END_USER;
+
+        const targetGroup = await getPermissionGroupById(targetGroupId);
+        if (!targetGroup) {
+            return response.status(400).json({ error: `Unknown group: ${targetGroupId}` });
+        }
+
+        // Privilege guard: inviter must hold every permission they're offering.
+        const allowed = await canAssignGroup(request.user.profile, targetGroup);
+        if (!allowed) {
+            return response.status(403).json({
+                error: `Cannot invite to group '${targetGroup.id}' — it contains permissions you don't hold`,
+            });
         }
 
         const label = String(request.body.label || '').trim().slice(0, 200);
         const expiresIn = request.body.expiresIn; // hours, optional
         const expiresAt = expiresIn ? Date.now() + Number(expiresIn) * 60 * 60 * 1000 : null;
 
+        // Derive a legacy role shim so older clients reading the invitation
+        // record still see something meaningful in the `role` field.
+        const shims = deriveLegacyShims(targetGroup.permissions);
+
         /** @type {Invitation} */
         const invite = {
             id: randomUUID(),
             token: randomBytes(32).toString('hex'),
-            role,
+            groupId: targetGroup.id,
+            role: shims.role,
             label,
             createdBy: request.user.profile.handle,
             createdAt: Date.now(),
@@ -91,8 +128,8 @@ router.post('/create', requireMinRole(ROLES.ADMIN), async (request, response) =>
     }
 });
 
-// POST /api/invitations/list — admin+
-router.post('/list', requireMinRole(ROLES.ADMIN), async (_request, response) => {
+// POST /api/invitations/list — requires admin:invitations:manage
+router.post('/list', requirePermission('admin:invitations:manage'), async (_request, response) => {
     try {
         const invites = await getAllInvitations();
         // Sort newest first
@@ -104,8 +141,8 @@ router.post('/list', requireMinRole(ROLES.ADMIN), async (_request, response) => 
     }
 });
 
-// POST /api/invitations/revoke — admin+
-router.post('/revoke', requireMinRole(ROLES.ADMIN), async (request, response) => {
+// POST /api/invitations/revoke — requires admin:invitations:manage
+router.post('/revoke', requirePermission('admin:invitations:manage'), async (request, response) => {
     try {
         const { id } = request.body;
         if (!id) {
@@ -130,8 +167,8 @@ router.post('/revoke', requireMinRole(ROLES.ADMIN), async (request, response) =>
     }
 });
 
-// POST /api/invitations/delete — admin+
-router.post('/delete', requireMinRole(ROLES.ADMIN), async (request, response) => {
+// POST /api/invitations/delete — requires admin:invitations:manage
+router.post('/delete', requirePermission('admin:invitations:manage'), async (request, response) => {
     try {
         const { id } = request.body;
         if (!id) {
@@ -169,9 +206,23 @@ router.get('/validate/:token', async (request, response) => {
             return response.status(410).json({ valid: false, error: 'Invitation has expired' });
         }
 
+        // Re-verify the group still exists and still has permissions.
+        // Otherwise an invite pointing at a deleted group would create a
+        // zero-permission user.
+        const targetGroup = await getPermissionGroupById(invite.groupId);
+        if (!targetGroup || !Array.isArray(targetGroup.permissions)) {
+            return response.status(410).json({
+                valid: false,
+                error: 'The group referenced by this invitation no longer exists',
+            });
+        }
+
         return response.json({
             valid: true,
-            role: invite.role,
+            groupId: invite.groupId,
+            groupName: targetGroup.name,
+            // Legacy shim for older frontends that read `role` off the response.
+            role: invite.role ?? deriveLegacyShims(targetGroup.permissions).role,
             label: invite.label,
         });
     } catch (error) {
@@ -202,6 +253,15 @@ router.post('/accept', async (request, response) => {
             return response.status(410).json({ error: 'Invitation has expired' });
         }
 
+        // Re-verify the target group. Snapshot semantics: we take the group
+        // *as it exists now*, not as it existed when the invitation was created.
+        const targetGroup = await getPermissionGroupById(invite.groupId);
+        if (!targetGroup || !Array.isArray(targetGroup.permissions)) {
+            return response.status(410).json({
+                error: 'The group referenced by this invitation no longer exists',
+            });
+        }
+
         // Normalise handle
         const handle = lodash.kebabCase(String(rawHandle).toLowerCase().trim());
         if (!handle) {
@@ -216,14 +276,17 @@ router.post('/accept', async (request, response) => {
         const salt = getPasswordSalt();
         const passwordHash = password ? getPasswordHash(password, salt) : '';
 
+        const shims = deriveLegacyShims(targetGroup.permissions);
+
         const newUser = {
             handle,
             name: String(rawName).trim().slice(0, 100) || 'Anonymous',
             created: Date.now(),
             password: passwordHash,
             salt,
-            admin: hasRole(invite.role, ROLES.ADMIN),
-            role: invite.role,
+            groupId: targetGroup.id,
+            admin: shims.admin,
+            role: shims.role,
             enabled: true,
         };
 

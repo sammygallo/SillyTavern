@@ -4,8 +4,8 @@ import path from 'node:path';
 import express from 'express';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { color, getConfigValue, uuidv4 } from '../util.js';
-import { requireMinRole } from '../users.js';
-import { ROLES, GLOBAL_DATA_DIR } from '../constants.js';
+import { requirePermission } from '../permissions.js';
+import { GLOBAL_DATA_DIR } from '../constants.js';
 
 export const SECRETS_FILE = 'secrets.json';
 export const SECRET_KEYS = {
@@ -710,7 +710,7 @@ router.post('/global/read', (request, response) => {
     }
 });
 
-router.post('/global/write', requireMinRole(ROLES.OWNER), (request, response) => {
+router.post('/global/write', requirePermission('settings:global_secrets'), (request, response) => {
     try {
         const { key, value, label } = request.body;
         if (!key || typeof value !== 'string') {
@@ -726,7 +726,7 @@ router.post('/global/write', requireMinRole(ROLES.OWNER), (request, response) =>
     }
 });
 
-router.post('/global/delete', requireMinRole(ROLES.OWNER), (request, response) => {
+router.post('/global/delete', requirePermission('settings:global_secrets'), (request, response) => {
     try {
         const { key, id } = request.body;
         if (!key) {
@@ -752,7 +752,7 @@ router.post('/global/status', (request, response) => {
     }
 });
 
-router.post('/global/toggle', requireMinRole(ROLES.OWNER), (request, response) => {
+router.post('/global/toggle', requirePermission('settings:global_secrets'), (request, response) => {
     try {
         const { enabled } = request.body;
         writeGlobalSharingEnabled(!!enabled);

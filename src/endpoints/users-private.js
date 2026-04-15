@@ -5,10 +5,11 @@ import crypto from 'node:crypto';
 import storage from 'node-persist';
 import express from 'express';
 
-import { getUserAvatar, toKey, getPasswordHash, getPasswordSalt, createBackupArchive, ensurePublicDirectoriesExist, toAvatarKey, getEffectiveRole, hasRole } from '../users.js';
-import { SETTINGS_FILE, ROLES } from '../constants.js';
+import { getUserAvatar, toKey, getPasswordHash, getPasswordSalt, createBackupArchive, ensurePublicDirectoriesExist, toAvatarKey } from '../users.js';
+import { SETTINGS_FILE } from '../constants.js';
 import { checkForNewContent, CONTENT_TYPES } from './content-manager.js';
 import { color, Cache } from '../util.js';
+import { getUserPermissions, hasPermission, hasPermissionInSet } from '../permissions.js';
 
 const RESET_CACHE = new Cache(5 * 60 * 1000);
 
@@ -37,13 +38,28 @@ router.get('/me', async (request, response) => {
             return response.sendStatus(403);
         }
 
-        const user = request.user.profile;
+        // Prefer the stored user record over request.user.profile — when
+        // accounts are disabled, `request.user.profile` is the frozen
+        // DEFAULT_USER from constants.js which does not carry the migrated
+        // groupId field. The storage copy does.
+        const handle = request.user.profile.handle;
+        const stored = await storage.getItem(toKey(handle));
+        const user = stored || request.user.profile;
+        const permissions = await getUserPermissions(user);
+
         const viewModel = {
             handle: user.handle,
             name: user.name,
             avatar: await getUserAvatar(user.handle),
-            admin: user.admin,
-            role: getEffectiveRole(user),
+            groupId: user.groupId ?? null,
+            permissions,
+            // Legacy shims — kept so the classic public/ UI and any external
+            // tooling that reads `user.admin` / `user.role` keep working.
+            admin: user.admin ?? hasPermissionInSet(permissions, 'admin:users:manage'),
+            role: user.role ?? (hasPermissionInSet(permissions, 'admin:groups:manage') ? 'owner'
+                : hasPermissionInSet(permissions, 'admin:users:manage') ? 'admin'
+                    : hasPermissionInSet(permissions, 'character:create') ? 'contributor'
+                        : 'end_user'),
             password: !!user.password,
             created: user.created,
         };
@@ -62,7 +78,7 @@ router.post('/change-avatar', async (request, response) => {
             return response.status(400).json({ error: 'Missing required fields' });
         }
 
-        if (request.body.handle !== request.user.profile.handle && !hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
+        if (request.body.handle !== request.user.profile.handle && !(await hasPermission(request.user.profile, 'admin:users:manage'))) {
             console.error('Change avatar failed: Unauthorized');
             return response.status(403).json({ error: 'Unauthorized' });
         }
@@ -97,7 +113,13 @@ router.post('/change-password', async (request, response) => {
             return response.status(400).json({ error: 'Missing required fields' });
         }
 
-        if (request.body.handle !== request.user.profile.handle && !hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
+        // Password-reset-as-admin requires a distinct permission from the
+        // general admin:users:manage, since it is a privilege-escalation
+        // vector when coarsely granted.
+        const isSelf = request.body.handle === request.user.profile.handle;
+        const canResetOthers = await hasPermission(request.user.profile, 'admin:users:reset_password');
+
+        if (!isSelf && !canResetOthers) {
             console.error('Change password failed: Unauthorized');
             return response.status(403).json({ error: 'Unauthorized' });
         }
@@ -115,7 +137,7 @@ router.post('/change-password', async (request, response) => {
             return response.status(403).json({ error: 'User is disabled' });
         }
 
-        if (!hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN) && user.password && user.password !== getPasswordHash(request.body.oldPassword, user.salt)) {
+        if (!canResetOthers && user.password && user.password !== getPasswordHash(request.body.oldPassword, user.salt)) {
             console.error('Change password failed: Incorrect password');
             return response.status(403).json({ error: 'Incorrect password' });
         }
@@ -146,8 +168,13 @@ router.post('/backup', async (request, response) => {
             return response.status(400).json({ error: 'Missing required fields' });
         }
 
-        if (handle !== request.user.profile.handle && !hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
+        const isSelfBackup = handle === request.user.profile.handle;
+        if (!isSelfBackup && !(await hasPermission(request.user.profile, 'system:backup:others'))) {
             console.error('Backup failed: Unauthorized');
+            return response.status(403).json({ error: 'Unauthorized' });
+        }
+        if (isSelfBackup && !(await hasPermission(request.user.profile, 'system:backup:self'))) {
+            console.error('Backup failed: Unauthorized (self-backup permission missing)');
             return response.status(403).json({ error: 'Unauthorized' });
         }
 
@@ -185,7 +212,7 @@ router.post('/change-name', async (request, response) => {
             return response.status(400).json({ error: 'Missing required fields' });
         }
 
-        if (request.body.handle !== request.user.profile.handle && !hasRole(getEffectiveRole(request.user.profile), ROLES.ADMIN)) {
+        if (request.body.handle !== request.user.profile.handle && !(await hasPermission(request.user.profile, 'admin:users:manage'))) {
             console.error('Change name failed: Unauthorized');
             return response.status(403).json({ error: 'Unauthorized' });
         }

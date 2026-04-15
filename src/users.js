@@ -21,6 +21,7 @@ import { readSecret, writeSecret } from './endpoints/secrets.js';
 import { getGlobalCharactersDir } from './character-globals.js';
 import { getContentOfType } from './endpoints/content-manager.js';
 import { serverDirectory } from './server-directory.js';
+import { initPermissionsAndMigrate } from './permissions.js';
 
 export const KEY_PREFIX = 'user:';
 const AVATAR_PREFIX = 'avatar:';
@@ -54,8 +55,9 @@ const STORAGE_KEYS = {
  * @property {string} password - Scrypt hash of the user's password
  * @property {string} salt - Salt used for hashing the password
  * @property {boolean} enabled - Whether the user is enabled
- * @property {boolean} admin - Whether the user is an admin. @deprecated Use role instead.
- * @property {string} [role] - One of: 'owner', 'admin', 'contributor', 'end_user'
+ * @property {string} [groupId] - Permission group id. Source of truth for auth.
+ * @property {boolean} admin - @deprecated Shim derived from groupId. Use permissions from `./permissions.js`.
+ * @property {string} [role] - @deprecated Shim derived from groupId. Use permissions from `./permissions.js`.
  */
 
 /**
@@ -63,8 +65,10 @@ const STORAGE_KEYS = {
  * @property {string} handle - The user's short handle. Used for directories and other references
  * @property {string} name - The user's name. Displayed in the UI
  * @property {string} avatar - The user's avatar image
- * @property {boolean} [admin] - Whether the user is an admin. @deprecated Use role instead.
- * @property {string} [role] - One of: 'owner', 'admin', 'contributor', 'end_user'
+ * @property {string} [groupId] - Permission group id.
+ * @property {string[]} [permissions] - Resolved permission list for this user.
+ * @property {boolean} [admin] - @deprecated Shim. Derived from groupId.
+ * @property {string} [role] - @deprecated Shim. Derived from groupId.
  * @property {boolean} password - Whether the user is password protected
  * @property {boolean} [enabled] - Whether the user is enabled
  * @property {number} [created] - The timestamp when the user was created
@@ -73,6 +77,10 @@ const STORAGE_KEYS = {
 /**
  * Gets the effective role of a user, handling backward compatibility.
  * If the user has a valid role field, use it. Otherwise, derive from admin boolean.
+ * @deprecated The role ladder has been replaced by permission groups. New code
+ *   should call `getUserPermissions` / `hasPermission` from `./permissions.js`
+ *   directly. This function is retained so that any lingering caller keeps
+ *   working against the shim `user.role` field.
  * @param {User} user
  * @returns {string}
  */
@@ -85,6 +93,7 @@ export function getEffectiveRole(user) {
 
 /**
  * Checks if a role meets or exceeds a minimum required role level.
+ * @deprecated Use `hasPermission` from `./permissions.js` instead.
  * @param {string} userRole The user's role
  * @param {string} minimumRole The minimum required role
  * @returns {boolean}
@@ -98,6 +107,8 @@ export function hasRole(userRole, minimumRole) {
 
 /**
  * Creates a middleware that checks if the user has one of the specified roles.
+ * @deprecated Use `requirePermission` / `requireAnyPermission` from
+ *   `./permissions.js`. Kept for any external plugin that imports it.
  * @param  {...string} roles Allowed roles
  * @returns {import('express').RequestHandler}
  */
@@ -117,6 +128,8 @@ export function requireRole(...roles) {
 
 /**
  * Creates a middleware that checks if the user has at least the specified role level.
+ * @deprecated Use `requirePermission` from `./permissions.js`. Kept for any
+ *   external plugin that imports it.
  * @param {string} minimumRole The minimum role required
  * @returns {import('express').RequestHandler}
  */
@@ -589,8 +602,12 @@ export async function initUserStorage(dataRoot) {
         await storage.setItem(toKey(DEFAULT_USER.handle), DEFAULT_USER);
     }
 
-    // Migrate existing users to role-based permissions
+    // Migrate existing users to role-based permissions (legacy shim layer)
     await migrateUsersToRoles();
+
+    // Seed default permission groups and migrate users onto the new groupId
+    // model. This is the source of truth for authorization going forward.
+    await initPermissionsAndMigrate();
 }
 
 /**
@@ -1100,28 +1117,6 @@ function createExtensionsRouteHandler(directoryFn) {
             return res.sendStatus(500);
         }
     };
-}
-
-/**
- * Verifies that the current user is an admin (or higher).
- * @deprecated Use requireRole or requireMinRole instead.
- * @param {import('express').Request} request Request object
- * @param {import('express').Response} response Response object
- * @param {import('express').NextFunction} next Next function
- * @returns {any}
- */
-export function requireAdminMiddleware(request, response, next) {
-    if (!request.user) {
-        return response.sendStatus(403);
-    }
-
-    const userRole = getEffectiveRole(request.user.profile);
-    if (hasRole(userRole, ROLES.ADMIN)) {
-        return next();
-    }
-
-    console.warn('Unauthorized access to admin endpoint:', request.originalUrl);
-    return response.sendStatus(403);
 }
 
 /**
