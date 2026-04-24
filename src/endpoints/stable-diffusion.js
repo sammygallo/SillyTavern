@@ -822,17 +822,26 @@ pollinations.post('/models', async (_request, response) => {
 pollinations.post('/generate', async (request, response) => {
     try {
         const promptUrl = new URL(`https://image.pollinations.ai/prompt/${encodeURIComponent(request.body.prompt)}`);
+        // NOTE: do NOT send `referrer` here. Pollinations now treats any
+        // request with a referrer as "authenticated" and rejects the legacy
+        // /prompt endpoint with: "Authenticated users should use
+        // enter.pollinations.ai for image generation. This legacy endpoint
+        // is for anonymous requests only." So anonymous = no referrer.
         const params = new URLSearchParams({
             model: String(request.body.model),
-            negative_prompt: String(request.body.negative_prompt),
             seed: String(request.body.seed >= 0 ? request.body.seed : Math.floor(Math.random() * 10_000_000)),
             width: String(request.body.width ?? 1024),
             height: String(request.body.height ?? 1024),
             nologo: String(true),
             nofeed: String(true),
             private: String(true),
-            referrer: 'sillytavern',
         });
+        // Only set negative_prompt when actually provided — String(undefined)
+        // produces the literal "undefined" which the model would dutifully
+        // try to negate-against.
+        if (request.body.negative_prompt) {
+            params.set('negative_prompt', String(request.body.negative_prompt));
+        }
         if (request.body.enhance) {
             params.set('enhance', String(true));
         }
@@ -854,6 +863,174 @@ pollinations.post('/generate', async (request, response) => {
         return response.send({ image: base64 });
     } catch (error) {
         console.error(error);
+        return response.sendStatus(500);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// AI Horde — distributed, free, anonymous-key-friendly image generation.
+// API docs: https://aihorde.net/api/
+// The flow is async: POST /generate/async to enqueue, then poll
+// /generate/check/{id} until done, then GET /generate/status/{id} for the
+// final image. Anonymous key "0000000000" works but is slow. Users can
+// register a free key on aihorde.net for higher priority.
+// ---------------------------------------------------------------------------
+
+const horde = express.Router();
+
+const HORDE_BASE = 'https://aihorde.net/api/v2';
+const HORDE_ANON_KEY = '0000000000';
+const HORDE_CLIENT_AGENT = 'SillyTavern:1.0:GoodGirlsBotClub';
+const HORDE_POLL_INTERVAL_MS = 2_000;
+const HORDE_MAX_POLL_MS = 180_000; // 3 minutes — kills request rather than holding forever
+
+horde.post('/models', async (_request, response) => {
+    try {
+        const modelsUrl = new URL(`${HORDE_BASE}/status/models?type=image`);
+        const result = await fetch(modelsUrl, {
+            headers: { 'Client-Agent': HORDE_CLIENT_AGENT },
+        });
+
+        if (!result.ok) {
+            console.warn('AI Horde models request failed:', result.status);
+            return response.sendStatus(500);
+        }
+
+        const data = await result.json();
+        // Sort by worker count descending so the dropdown surfaces models
+        // with the most capacity first (faster turnarounds for the user).
+        const sorted = Array.isArray(data)
+            ? data
+                .filter((m) => m && typeof m.name === 'string')
+                .sort((a, b) => (b.count ?? 0) - (a.count ?? 0))
+                .slice(0, 30)
+                .map((m) => ({
+                    name: m.name,
+                    count: m.count ?? 0,
+                    queued: m.queued ?? 0,
+                    eta: m.eta ?? 0,
+                }))
+            : [];
+        return response.send(sorted);
+    } catch (error) {
+        console.error('AI Horde models error:', error);
+        return response.sendStatus(500);
+    }
+});
+
+horde.post('/generate', async (request, response) => {
+    try {
+        const apiKey = request.body.api_key || HORDE_ANON_KEY;
+        const model = String(request.body.model || 'stable_diffusion');
+        const payload = {
+            prompt: String(request.body.prompt),
+            params: {
+                sampler_name: String(request.body.sampler_name || 'k_euler_a'),
+                cfg_scale: Number(request.body.cfg_scale ?? 7),
+                steps: Math.min(50, Math.max(1, Number(request.body.steps ?? 25))),
+                width: Number(request.body.width ?? 512),
+                height: Number(request.body.height ?? 512),
+                seed_variation: 1,
+                karras: true,
+                hires_fix: false,
+                clip_skip: 1,
+                tiling: false,
+                n: 1,
+            },
+            nsfw: !!request.body.nsfw,
+            censor_nsfw: false,
+            trusted_workers: false,
+            slow_workers: true,
+            r2: true,
+            shared: false,
+            models: [model],
+        };
+        if (request.body.negative_prompt) {
+            payload.prompt = `${payload.prompt} ### ${String(request.body.negative_prompt)}`;
+        }
+
+        const enqueueRes = await fetch(`${HORDE_BASE}/generate/async`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'apikey': apiKey,
+                'Client-Agent': HORDE_CLIENT_AGENT,
+            },
+            body: JSON.stringify(payload),
+        });
+
+        if (!enqueueRes.ok) {
+            const text = await enqueueRes.text();
+            console.warn('AI Horde enqueue failed:', enqueueRes.status, text);
+            return response.status(enqueueRes.status).send({ error: text });
+        }
+
+        const enqueueData = await enqueueRes.json();
+        const jobId = enqueueData.id;
+        if (!jobId) {
+            console.warn('AI Horde enqueue returned no id:', enqueueData);
+            return response.sendStatus(500);
+        }
+
+        // Poll until done or we hit our timeout. Each tick is cheap; we just
+        // hit /check until it flips, then pull the actual image from /status.
+        const startedAt = Date.now();
+        let isDone = false;
+        while (!isDone) {
+            if (Date.now() - startedAt > HORDE_MAX_POLL_MS) {
+                console.warn(`AI Horde job ${jobId} exceeded ${HORDE_MAX_POLL_MS}ms — cancelling`);
+                // Best-effort cancel; ignore failure.
+                try {
+                    await fetch(`${HORDE_BASE}/generate/status/${jobId}`, {
+                        method: 'DELETE',
+                        headers: { 'Client-Agent': HORDE_CLIENT_AGENT },
+                    });
+                } catch { /* ignore */ }
+                return response.status(504).send({ error: 'AI Horde generation timed out' });
+            }
+
+            await delay(HORDE_POLL_INTERVAL_MS);
+            const checkRes = await fetch(`${HORDE_BASE}/generate/check/${jobId}`, {
+                headers: { 'Client-Agent': HORDE_CLIENT_AGENT },
+            });
+            if (!checkRes.ok) {
+                console.warn('AI Horde check failed:', checkRes.status);
+                continue;
+            }
+            const checkData = await checkRes.json();
+            if (checkData.faulted) {
+                return response.status(500).send({ error: 'AI Horde job faulted' });
+            }
+            if (checkData.done) isDone = true;
+        }
+
+        const statusRes = await fetch(`${HORDE_BASE}/generate/status/${jobId}`, {
+            headers: { 'Client-Agent': HORDE_CLIENT_AGENT },
+        });
+        if (!statusRes.ok) {
+            console.warn('AI Horde status fetch failed:', statusRes.status);
+            return response.sendStatus(500);
+        }
+        const statusData = await statusRes.json();
+        const generation = statusData.generations?.[0];
+        if (!generation?.img) {
+            console.warn('AI Horde status returned no image:', statusData);
+            return response.sendStatus(500);
+        }
+
+        // With r2:true the `img` field is an R2 URL we still have to fetch
+        // and base64-encode here — keeps the frontend protocol identical
+        // across all backends (everyone returns {image: <base64>}).
+        const imgRes = await fetch(generation.img);
+        if (!imgRes.ok) {
+            console.warn('AI Horde image fetch failed:', imgRes.status);
+            return response.sendStatus(500);
+        }
+        const buffer = await imgRes.arrayBuffer();
+        const base64 = Buffer.from(buffer).toString('base64');
+        return response.send({ image: base64, model: generation.model, worker: generation.worker_name });
+    } catch (error) {
+        console.error('AI Horde generate error:', error);
         return response.sendStatus(500);
     }
 });
@@ -1564,6 +1741,7 @@ router.use('/comfy', comfy);
 router.use('/together', together);
 router.use('/drawthings', drawthings);
 router.use('/pollinations', pollinations);
+router.use('/horde', horde);
 router.use('/stability', stability);
 router.use('/huggingface', huggingface);
 router.use('/electronhub', electronhub);
