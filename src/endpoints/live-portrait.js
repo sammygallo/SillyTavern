@@ -340,6 +340,47 @@ router.get('/status/:jobId', (request, response) => {
     });
 });
 
+/**
+ * Discover any already-generated clips for a character. Lets clients
+ * auto-populate their local clip-URL store on character load — without
+ * this, only the device that ran generation knows the clips exist
+ * (the URLs were saved to localStorage there).
+ */
+router.get('/list/:characterName', async (request, response) => {
+    try {
+        const { characterName } = request.params;
+        if (!characterName) {
+            return response.status(400).json({ error: 'characterName required' });
+        }
+
+        const avatarFilename = `${characterName}.png`;
+        const resolved = resolveCharacterPath(request.user.directories, avatarFilename);
+        const baseDir = resolved.scope === 'global'
+            ? getGlobalCharactersDir()
+            : request.user.directories.characters;
+
+        const liveDir = path.join(baseDir, characterName, 'live');
+        const clips = {};
+        try {
+            const files = await fs.promises.readdir(liveDir);
+            for (const file of files) {
+                if (!file.endsWith('.mp4')) continue;
+                const emotion = file.slice(0, -4);
+                if (!SUPPORTED_EMOTIONS.includes(emotion)) continue;
+                clips[emotion] = `/characters/${encodeURIComponent(characterName)}/live/${file}`;
+            }
+        } catch {
+            // No live/ dir yet — return empty.
+        }
+
+        return response.json({ clips });
+    } catch (err) {
+        return response.status(500).json({
+            error: err instanceof Error ? err.message : 'List failed',
+        });
+    }
+});
+
 router.get('/emotions', (_request, response) => {
     return response.json({ emotions: SUPPORTED_EMOTIONS });
 });
