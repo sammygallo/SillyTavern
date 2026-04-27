@@ -37,6 +37,7 @@ import fetch from 'node-fetch';
 import FormData from 'form-data';
 
 import { readSecret, SECRET_KEYS } from './secrets.js';
+import { resolveCharacterPath, getGlobalCharactersDir } from '../character-globals.js';
 
 export const router = express.Router();
 
@@ -219,16 +220,24 @@ async function runJob(jobId, request, characterName, emotions) {
             return;
         }
 
-        // Find the character's portrait image.
-        // Expression images live in {characters_dir}/{name}/ (neutral.png etc.),
-        // character card as {name}.png or default_{name}.png.
-        const charSubDir = path.join(request.user.directories.characters, characterName);
+        // Resolve the character's portrait. Avatars live in either the user's
+        // personal characters dir or _global/characters/ (for shared characters);
+        // resolveCharacterPath checks the global scope first when registered.
+        // We try the canonical {name}.png first, then expression-folder fallbacks
+        // in the same scope.
+        const avatarFilename = `${characterName}.png`;
+        const resolved = resolveCharacterPath(request.user.directories, avatarFilename);
+        const baseDir = resolved.scope === 'global'
+            ? getGlobalCharactersDir()
+            : request.user.directories.characters;
+
+        const charSubDir = path.join(baseDir, characterName);
         const candidatePaths = [
+            path.join(baseDir, avatarFilename),
+            path.join(baseDir, `default_${avatarFilename}`),
             path.join(charSubDir, 'neutral.png'),
             path.join(charSubDir, 'admiration.png'),
             path.join(charSubDir, 'joy.png'),
-            path.join(request.user.directories.characters, `${characterName}.png`),
-            path.join(request.user.directories.characters, `default_${characterName}.png`),
         ];
 
         let avatarBuffer = null;
@@ -250,12 +259,12 @@ async function runJob(jobId, request, characterName, emotions) {
 
         // Upload avatar once to Replicate Files; reuse the HTTPS URL for all clips.
         const avatarUrl = await uploadToReplicateFiles(
-            apiKey, avatarBuffer, `${characterName}.png`,
+            apiKey, avatarBuffer, avatarFilename,
         );
 
         const total = emotions.length;
         let done = 0;
-        const charDir = path.join(request.user.directories.characters, characterName, 'live');
+        const charDir = path.join(baseDir, characterName, 'live');
         await fs.promises.mkdir(charDir, { recursive: true });
 
         for (const emotion of emotions) {
