@@ -65,6 +65,11 @@ export const SECRET_KEYS = {
     AZURE_OPENAI: 'api_key_azure_openai',
     ZAI: 'api_key_zai',
     SILICONFLOW: 'api_key_siliconflow',
+    // GGBC Live Portrait — used by the per-character animation generator
+    // (src/api/livePortraitGen.ts) to call Sieve's Live Portrait endpoint
+    // server-side so the key never reaches the browser. One-time key per
+    // deployment, billed per generation (~$0.01–0.03 per clip).
+    SIEVE: 'api_key_sieve',
 };
 
 /**
