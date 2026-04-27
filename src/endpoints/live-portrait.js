@@ -1,32 +1,32 @@
 /**
  * Live Portrait — generate animated character clips via Replicate's
- * fofr/live-portrait model.
+ * wan-video/wan-2.2-i2v-fast model.
  *
  * GGBC's static-avatar replacement: instead of warping a single image at
- * render time (the previous mesh-warp approach), we generate a small set of
- * MP4 clips per character at setup time and play them on loop in chat.
- * Idle clip when the AI isn't talking, per-emotion clip when it is.
+ * render time, we generate a small set of MP4 clips per character at setup
+ * time and play them on loop in chat. Idle clip when the AI isn't talking,
+ * per-emotion clip when it is.
  *
- * Why server-side: the Replicate API key (api_key_replicate) lives in the
- * user's secrets store and must never reach the browser. This module is the
- * trusted middleman — frontend posts an avatar + an emotion list, this
- * route reads the secret, calls Replicate, saves the resulting MP4s into the
- * character's data directory, and returns URLs the frontend can <video>.
+ * Why server-side: the Replicate API key lives in the user's secrets store
+ * and must never reach the browser. This module is the trusted middleman —
+ * frontend posts a character name + emotion list, this route reads the secret,
+ * uploads the avatar to Replicate Files (to get an HTTPS URL the model can
+ * fetch), calls wan-2.2-i2v-fast once per emotion, saves the resulting MP4s
+ * into the character data dir, and returns URLs the frontend can <video>.
  *
- * Replicate API contract (fofr/live-portrait model):
- *   POST https://api.replicate.com/v1/models/fofr/live-portrait/predictions
+ * Replicate API contract (wan-video/wan-2.2-i2v-fast):
+ *   POST https://api.replicate.com/v1/models/wan-video/wan-2.2-i2v-fast/predictions
  *     headers: { Authorization: "Bearer <key>", Content-Type: "application/json",
- *                Prefer: "wait=30" }
- *     body: { input: { source_image: "<url>", driving_video: "<url>" } }
+ *                Prefer: "wait=60" }
+ *     body: { input: { image: "<https url>", prompt: "<emotion prompt>",
+ *                      num_frames: 81, resolution: "480p", frames_per_second: 16 } }
  *     → { id, status: "starting"|"processing"|"succeeded"|"failed"|"canceled",
  *          output: null | string | string[] }
  *   GET https://api.replicate.com/v1/predictions/{id}
  *     → same shape; poll until status is "succeeded" or terminal
  *
- * Job tracking is in-memory: simple Map<jobId, JobState>. There's no Redis or
- * durable queue in this codebase, and jobs only need to survive a single
- * polling cycle from the frontend (~30–60s). Restart wipes them; the
- * frontend re-issues if needed.
+ * Job tracking is in-memory: simple Map<jobId, JobState>. Restart wipes them;
+ * the frontend re-issues if needed.
  */
 
 import fs from 'node:fs';
@@ -34,6 +34,7 @@ import path from 'node:path';
 
 import express from 'express';
 import fetch from 'node-fetch';
+import FormData from 'form-data';
 
 import { readSecret, SECRET_KEYS } from './secrets.js';
 
@@ -43,33 +44,26 @@ export const router = express.Router();
 // Constants
 // ---------------------------------------------------------------------------
 
-const REPLICATE_PREDICT_URL = 'https://api.replicate.com/v1/models/fofr/live-portrait/predictions';
+const REPLICATE_WAN_URL = 'https://api.replicate.com/v1/models/wan-video/wan-2.2-i2v-fast/predictions';
 const REPLICATE_POLL_BASE = 'https://api.replicate.com/v1/predictions';
 
+/** Canonical emotion set — order matters for UI display. */
+const SUPPORTED_EMOTIONS = ['idle', 'happy', 'sad', 'angry', 'surprised', 'neutral'];
+
 /**
- * Per-emotion driving videos that Replicate transfers onto the user's avatar.
- * These need to be publicly accessible URLs that Replicate can fetch from.
- * For dev we point at GGBC-hosted clips on a public CDN; for production swap
- * in your own URLs (see README — emotion-driver-videos section).
- *
- * Each clip should be ~5–10s, 24fps, neutral-faced subject performing the
- * targeted emotion (slight smile for "happy", frown for "sad", etc.).
- *
- * TODO(GGBC-team): replace the placeholder URLs below with real clips
- * once we've recorded the driving set.
+ * Per-emotion text prompts. The wan model infers the character's visual style
+ * from the source image; the prompt describes the desired motion and expression.
  */
-const DRIVING_VIDEOS = {
-    idle: 'https://example.invalid/live-portrait-drivers/idle.mp4',
-    happy: 'https://example.invalid/live-portrait-drivers/happy.mp4',
-    sad: 'https://example.invalid/live-portrait-drivers/sad.mp4',
-    angry: 'https://example.invalid/live-portrait-drivers/angry.mp4',
-    surprised: 'https://example.invalid/live-portrait-drivers/surprised.mp4',
-    neutral: 'https://example.invalid/live-portrait-drivers/neutral.mp4',
+const EMOTION_PROMPTS = {
+    idle: 'subtle breathing motion, calm neutral expression, gentle idle animation, slight head movement',
+    happy: 'smiling warmly, happy joyful expression, eyes slightly squinting with joy, gentle head movement',
+    sad: 'sad downcast expression, slightly drooping head, melancholy look, subtle movement',
+    angry: 'angry expression, furrowed brows, intense gaze, slight jaw tension',
+    surprised: 'surprised expression, wide eyes, eyebrows raised, slight backward head movement',
+    neutral: 'neutral calm expression, relaxed face, minimal movement, subtle breathing',
 };
 
-const SUPPORTED_EMOTIONS = Object.keys(DRIVING_VIDEOS);
-
-const POLL_INTERVAL_MS = 2000;
+const POLL_INTERVAL_MS = 3000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per clip
 
 // ---------------------------------------------------------------------------
@@ -88,10 +82,6 @@ const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per clip
 /** @type {Map<string, JobState>} */
 const jobs = new Map();
 
-/**
- * Garbage-collect old completed/error jobs every 10 minutes. In-memory only;
- * no recovery on restart.
- */
 setInterval(() => {
     const now = Date.now();
     for (const [id, state] of jobs.entries()) {
@@ -105,13 +95,6 @@ setInterval(() => {
 // Replicate client
 // ---------------------------------------------------------------------------
 
-/**
- * Extract the output URL from a completed Replicate prediction.
- * Replicate models can return a single string or an array of strings.
- *
- * @param {object} prediction
- * @returns {string}
- */
 function extractOutput(prediction) {
     const output = prediction.output;
     if (!output) throw new Error('Replicate prediction succeeded but returned no output');
@@ -119,29 +102,63 @@ function extractOutput(prediction) {
 }
 
 /**
- * Submit a single Live Portrait job to Replicate and poll until it's done.
- * Returns the URL of the rendered MP4 (Replicate-hosted).
- *
- * Uses `Prefer: wait=30` so that short predictions resolve in the initial
- * response without a separate poll round-trip.
+ * Upload a buffer to Replicate Files API as multipart/form-data.
+ * The SDK uses FormData with a `content` field + empty `metadata` field.
+ * Returns the HTTPS URL the wan model can fetch.
  *
  * @param {string} apiKey
- * @param {string} sourceImageUrl URL Replicate can fetch (the character avatar)
- * @param {string} drivingVideoUrl URL of the driving emotion clip
- * @returns {Promise<string>} URL of the rendered MP4
+ * @param {Buffer} buffer
+ * @param {string} filename
+ * @returns {Promise<string>}
  */
-async function generateOneClip(apiKey, sourceImageUrl, drivingVideoUrl) {
-    const submitRes = await fetch(REPLICATE_PREDICT_URL, {
+async function uploadToReplicateFiles(apiKey, buffer, filename) {
+    const form = new FormData();
+    form.append('content', buffer, { filename, contentType: 'application/octet-stream' });
+    form.append('metadata', Buffer.from('{}'), { contentType: 'application/json' });
+
+    const uploadRes = await fetch('https://api.replicate.com/v1/files', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            ...form.getHeaders(),
+        },
+        body: form,
+    });
+    if (!uploadRes.ok) {
+        const txt = await uploadRes.text().catch(() => '');
+        throw new Error(`Replicate file upload failed (${uploadRes.status}): ${txt.slice(0, 200)}`);
+    }
+    const data = await uploadRes.json();
+    const url = data?.urls?.get;
+    if (!url) throw new Error('Replicate file upload returned no URL');
+    return url;
+}
+
+/**
+ * Submit a single wan-2.2-i2v-fast job and poll until done.
+ * Returns the URL of the rendered MP4 (Replicate-hosted).
+ *
+ * @param {string} apiKey
+ * @param {string} imageUrl HTTPS URL of the character portrait (from Replicate Files)
+ * @param {string} emotionPrompt Motion/expression description
+ * @returns {Promise<string>}
+ */
+async function generateOneClip(apiKey, imageUrl, emotionPrompt) {
+    const submitRes = await fetch(REPLICATE_WAN_URL, {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${apiKey}`,
             'Content-Type': 'application/json',
-            'Prefer': 'wait=30',
+            'Prefer': 'wait=60',
         },
         body: JSON.stringify({
             input: {
-                source_image: sourceImageUrl,
-                driving_video: drivingVideoUrl,
+                image: imageUrl,
+                prompt: emotionPrompt,
+                num_frames: 81,
+                resolution: '480p',
+                frames_per_second: 16,
+                go_fast: true,
             },
         }),
     });
@@ -151,7 +168,6 @@ async function generateOneClip(apiKey, sourceImageUrl, drivingVideoUrl) {
     }
     let prediction = await submitRes.json();
 
-    // Prefer: wait=30 may return a fully completed prediction immediately.
     if (prediction.status === 'succeeded') return extractOutput(prediction);
     if (prediction.status === 'failed' || prediction.status === 'canceled') {
         throw new Error(`Replicate prediction ${prediction.status}: ${prediction.error ?? 'unknown'}`);
@@ -175,17 +191,10 @@ async function generateOneClip(apiKey, sourceImageUrl, drivingVideoUrl) {
         if (prediction.status === 'failed' || prediction.status === 'canceled') {
             throw new Error(`Replicate prediction ${prediction.status}: ${prediction.error ?? 'unknown'}`);
         }
-        // starting / processing — keep polling
     }
     throw new Error('Replicate prediction timed out after 5 minutes');
 }
 
-/**
- * Download a remote video URL into the given local file path.
- *
- * @param {string} url
- * @param {string} destPath
- */
 async function downloadTo(url, destPath) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Download failed (${res.status}) for ${url}`);
@@ -198,10 +207,6 @@ async function downloadTo(url, destPath) {
 // Job runner
 // ---------------------------------------------------------------------------
 
-/**
- * Run a multi-emotion generation job in the background. Updates the in-memory
- * jobs map as each clip finishes.
- */
 async function runJob(jobId, request, characterName, emotions) {
     const state = jobs.get(jobId);
     if (!state) return;
@@ -214,14 +219,39 @@ async function runJob(jobId, request, characterName, emotions) {
             return;
         }
 
-        // The browser will already have access to /characters/<name> via
-        // the existing static route, but Replicate needs an absolute URL. We
-        // build one from the request's host/protocol.
-        const proto = request.protocol;
-        const host = request.get('host');
-        const sourceImageUrl = `${proto}://${host}/characters/${encodeURIComponent(characterName)}.png`;
+        // Find the character's portrait image.
+        // Expression images live in {characters_dir}/{name}/ (neutral.png etc.),
+        // character card as {name}.png or default_{name}.png.
+        const charSubDir = path.join(request.user.directories.characters, characterName);
+        const candidatePaths = [
+            path.join(charSubDir, 'neutral.png'),
+            path.join(charSubDir, 'admiration.png'),
+            path.join(charSubDir, 'joy.png'),
+            path.join(request.user.directories.characters, `${characterName}.png`),
+            path.join(request.user.directories.characters, `default_${characterName}.png`),
+        ];
+
+        let avatarBuffer = null;
+        for (const imgPath of candidatePaths) {
+            try {
+                avatarBuffer = await fs.promises.readFile(imgPath);
+                break;
+            } catch {
+                // try next candidate
+            }
+        }
+        if (!avatarBuffer) {
+            state.status = 'error';
+            state.error = `Avatar image not found for character "${characterName}". Make sure the character has a portrait set.`;
+            return;
+        }
 
         state.status = 'running';
+
+        // Upload avatar once to Replicate Files; reuse the HTTPS URL for all clips.
+        const avatarUrl = await uploadToReplicateFiles(
+            apiKey, avatarBuffer, `${characterName}.png`,
+        );
 
         const total = emotions.length;
         let done = 0;
@@ -232,8 +262,8 @@ async function runJob(jobId, request, characterName, emotions) {
             if (!SUPPORTED_EMOTIONS.includes(emotion)) {
                 throw new Error(`Unsupported emotion: ${emotion}`);
             }
-            const drivingUrl = DRIVING_VIDEOS[emotion];
-            const replicateOutputUrl = await generateOneClip(apiKey, sourceImageUrl, drivingUrl);
+            const prompt = EMOTION_PROMPTS[emotion];
+            const replicateOutputUrl = await generateOneClip(apiKey, avatarUrl, prompt);
             const localPath = path.join(charDir, `${emotion}.mp4`);
             await downloadTo(replicateOutputUrl, localPath);
 
@@ -279,7 +309,6 @@ router.post('/generate', async (request, response) => {
             startedAt: Date.now(),
         });
 
-        // Fire-and-forget. The frontend polls /status/:jobId.
         runJob(jobId, request, characterName, emotions).catch(() => {});
 
         return response.json({ jobId, status: 'queued' });
