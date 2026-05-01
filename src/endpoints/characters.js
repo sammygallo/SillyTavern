@@ -20,7 +20,7 @@ import { parse, read, write } from '../character-card-parser.js';
 import { readWorldInfoFile } from './worldinfo.js';
 import { invalidateThumbnail } from './thumbnails.js';
 import { importRisuSprites } from './sprites.js';
-import { getUserDirectories, getEffectiveRole } from '../users.js';
+import { getUserDirectories, getEffectiveRole, getAllUserHandles } from '../users.js';
 import { requirePermission } from '../permissions.js';
 import { getChatInfo } from './chats.js';
 import { ByafParser } from '../byaf.js';
@@ -33,6 +33,7 @@ import {
     listGlobalCharacterFiles,
     makeGlobalScopedDirectories,
     setVisibility as setCharacterVisibility,
+    transferOwnership as transferCharacterOwnership,
     removeMetadataEntry as removeCharacterMetadataEntry,
     renameMetadataEntry as renameCharacterMetadataEntry,
     getGlobalCharactersDir,
@@ -1786,6 +1787,60 @@ router.post('/set-visibility', requirePermission('character:set_global'), valida
         return response.send({ ok: true, moved: result.moved, visibility });
     } catch (err) {
         console.error('Failed to set character visibility', err);
+        return response.sendStatus(500);
+    }
+});
+
+/**
+ * POST /api/characters/transfer-ownership
+ *
+ * Body: { avatar_url: string, new_owner_handle: string }
+ *
+ * Lets the current owner of a *global* character hand it off to another user.
+ * Metadata-only — the PNG stays in `_global/characters/`. The recipient sees
+ * the character as theirs on next refresh.
+ *
+ * Personal characters are out of scope here; transferring those requires
+ * moving files between user directories and resolving filename conflicts.
+ */
+router.post('/transfer-ownership', validateAvatarUrlMiddleware, async function (request, response) {
+    try {
+        if (!request.body?.avatar_url || !request.body?.new_owner_handle) {
+            return response.sendStatus(400);
+        }
+
+        const callerHandle = request.user.profile?.handle;
+        if (!callerHandle) {
+            return response.sendStatus(401);
+        }
+
+        const newOwnerHandle = String(request.body.new_owner_handle);
+        const allHandles = await getAllUserHandles();
+        if (!allHandles.includes(newOwnerHandle)) {
+            return response.status(404).send({ error: 'recipient_not_found' });
+        }
+
+        const result = transferCharacterOwnership({
+            avatar: request.body.avatar_url,
+            currentOwnerHandle: callerHandle,
+            newOwnerHandle,
+        });
+
+        if (result.ok) {
+            return response.send({ ok: true });
+        }
+
+        const statusByReason = {
+            invalid_filename: 400,
+            invalid_recipient: 400,
+            same_owner: 400,
+            not_global: 409,
+            not_owner: 403,
+        };
+        const status = statusByReason[result.reason] ?? 500;
+        return response.status(status).send({ error: result.reason ?? 'unknown' });
+    } catch (err) {
+        console.error('Failed to transfer character ownership', err);
         return response.sendStatus(500);
     }
 });
