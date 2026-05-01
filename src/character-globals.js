@@ -311,6 +311,48 @@ export function removeMetadataEntry(avatar) {
 }
 
 /**
+ * Transfers ownership of a global character to another user. Metadata-only —
+ * the PNG stays in `_global/characters/`. Returns a reason code so the caller
+ * can map it to an HTTP status.
+ *
+ * @param {object} params
+ * @param {string} params.avatar Character filename (e.g. "Seraphina.png").
+ * @param {string} params.currentOwnerHandle Handle that must match the existing owner.
+ * @param {string} params.newOwnerHandle Handle to record as the new owner.
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+export function transferOwnership({ avatar, currentOwnerHandle, newOwnerHandle }) {
+    const safe = sanitize(avatar);
+    if (!safe || safe !== avatar) {
+        return { ok: false, reason: 'invalid_filename' };
+    }
+    if (!newOwnerHandle || typeof newOwnerHandle !== 'string') {
+        return { ok: false, reason: 'invalid_recipient' };
+    }
+
+    const metadata = readMetadata();
+    const entry = metadata[safe];
+    if (!entry || entry.visibility !== 'global') {
+        return { ok: false, reason: 'not_global' };
+    }
+    if (entry.ownerHandle !== currentOwnerHandle) {
+        return { ok: false, reason: 'not_owner' };
+    }
+    if (newOwnerHandle === currentOwnerHandle) {
+        return { ok: false, reason: 'same_owner' };
+    }
+
+    metadata[safe] = {
+        ...entry,
+        ownerHandle: newOwnerHandle,
+        transferredAt: Date.now(),
+        previousOwnerHandle: currentOwnerHandle,
+    };
+    writeMetadata(metadata);
+    return { ok: true };
+}
+
+/**
  * Renames the metadata entry for a character (used when a global character is renamed).
  * @param {string} oldAvatar
  * @param {string} newAvatar

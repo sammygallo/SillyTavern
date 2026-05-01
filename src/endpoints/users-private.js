@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import storage from 'node-persist';
 import express from 'express';
 
-import { getUserAvatar, toKey, getPasswordHash, getPasswordSalt, createBackupArchive, ensurePublicDirectoriesExist, toAvatarKey } from '../users.js';
+import { getUserAvatar, toKey, getPasswordHash, getPasswordSalt, createBackupArchive, ensurePublicDirectoriesExist, toAvatarKey, KEY_PREFIX } from '../users.js';
 import { SETTINGS_FILE } from '../constants.js';
 import { checkForNewContent, CONTENT_TYPES } from './content-manager.js';
 import { color, Cache } from '../util.js';
@@ -67,6 +67,28 @@ router.get('/me', async (request, response) => {
         return response.json(viewModel);
     } catch (error) {
         console.error(error);
+        return response.sendStatus(500);
+    }
+});
+
+/**
+ * POST /api/users/handles
+ *
+ * Returns enabled users' handles + display names so any authenticated user
+ * can pick a recipient (e.g. for transferring character ownership). Excludes
+ * the requester. Minimal projection — no email, no role, no avatar.
+ */
+router.post('/handles', async (request, response) => {
+    try {
+        const callerHandle = request.user?.profile?.handle ?? null;
+        const users = await storage.values(x => x.key.startsWith(KEY_PREFIX));
+        const items = users
+            .filter(u => u.enabled && u.handle !== callerHandle)
+            .map(u => ({ handle: u.handle, name: u.name }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+        return response.json(items);
+    } catch (error) {
+        console.error('Failed to list user handles', error);
         return response.sendStatus(500);
     }
 });
